@@ -1,4 +1,4 @@
-# Proyecto Prueba RAG
+# Custom Document Chat — RAG System with PDF Uploads
 
 Proyecto RAG local con:
 
