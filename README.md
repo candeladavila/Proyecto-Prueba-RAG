@@ -791,10 +791,9 @@ El proyecto ya permite:
 
 ```text
 1. Mejorar diseño del chat
-2. Añadir listado de documentos subidos
-3. Añadir botón para borrar documentos
-4. Añadir indicador de si Qdrant está conectado
-5. Añadir fallback a Groq si Gemini devuelve 503
-6. Convertir scripts en funciones Python en vez de ejecutarlos con subprocess
-7. Desplegar frontend y backend
+2. Añadir botón para borrar documentos
+3. Añadir indicador de si Qdrant está conectado
+4. Añadir fallback a Groq si Gemini devuelve 503
+5. Convertir scripts en funciones Python en vez de ejecutarlos con subprocess
+6. Desplegar frontend y backend
 ```
