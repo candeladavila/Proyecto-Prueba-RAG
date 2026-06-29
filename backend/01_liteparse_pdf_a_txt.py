@@ -8,7 +8,7 @@ from typing import Any
 from liteparse import LiteParse
 from pypdf import PdfReader
 
-from backend.config import DOCUMENTOS_DIR, PARSED_DIR, PAGES_SUFFIX
+from config import DOCUMENTOS_DIR, PARSED_DIR, PAGES_SUFFIX
 
 HEADER_RE = re.compile(
     r"Mercedes-Benz\s*-\s*documento de prueba RAG\s*\|\s*P[aá]gina\s*\d+",

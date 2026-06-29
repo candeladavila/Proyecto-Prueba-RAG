@@ -5,7 +5,7 @@ import json
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-from backend.config import CHUNKS_FILE, EMBEDDING_MODEL, EMBEDDINGS_DIR, EMBEDDINGS_FILE, METADATA_FILE
+from config import CHUNKS_FILE, EMBEDDING_MODEL, EMBEDDINGS_DIR, EMBEDDINGS_FILE, METADATA_FILE
 
 
 def main() -> None:

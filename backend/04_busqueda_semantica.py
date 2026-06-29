@@ -6,7 +6,7 @@ import sys
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-from backend.config import EMBEDDING_MODEL, EMBEDDINGS_FILE, METADATA_FILE
+from config import EMBEDDING_MODEL, EMBEDDINGS_FILE, METADATA_FILE
 
 
 def buscar(query: str, top_k: int = 4) -> None:

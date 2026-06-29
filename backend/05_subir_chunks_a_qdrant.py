@@ -1,111 +1,120 @@
-"""
-Sube chunks a Qdrant con dos mejoras importantes:
-1) Antes de reindexar, borra únicamente los chunks de los documentos incluidos en chunks.jsonl.
-2) Si la colección ya existe, valida que su dimensión vectorial coincida con el modelo actual.
-"""
-
-from __future__ import annotations
-
 import argparse
-import hashlib
 import json
-import sys
 import uuid
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
+from langchain_huggingface import HuggingFaceEmbeddings
 from qdrant_client import QdrantClient, models
-from sentence_transformers import SentenceTransformer
 
-from backend.config import (
+from config import (
     CHUNKS_FILE,
-    EMBED_BATCH_SIZE,
     EMBEDDING_MODEL,
     QDRANT_API_KEY,
     QDRANT_COLLECTION,
     QDRANT_URL,
-    UPSERT_BATCH_SIZE,
 )
 
 
-def read_chunks(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        raise FileNotFoundError(f"No existe el archivo de chunks: {path}")
+def validate_config() -> None:
+    missing = []
 
-    raw = path.read_text(encoding="utf-8").strip()
-    if not raw:
-        raise ValueError(f"El archivo de chunks está vacío: {path}")
+    if not QDRANT_URL:
+        missing.append("QDRANT_URL")
 
-    if path.suffix.lower() == ".jsonl":
-        chunks: list[dict[str, Any]] = []
-        for line_number, line in enumerate(raw.splitlines(), start=1):
+    if not QDRANT_API_KEY:
+        missing.append("QDRANT_API_KEY")
+
+    if not QDRANT_COLLECTION:
+        missing.append("QDRANT_COLLECTION")
+
+    if missing:
+        raise RuntimeError("Faltan variables en .env: " + ", ".join(missing))
+
+
+def load_chunks(chunks_path: Path) -> list[dict[str, Any]]:
+    if not chunks_path.exists():
+        raise FileNotFoundError(f"No existe el archivo de chunks: {chunks_path}")
+
+    chunks = []
+
+    with chunks_path.open("r", encoding="utf-8") as file:
+        for line in file:
             line = line.strip()
+
             if not line:
                 continue
-            try:
-                chunks.append(json.loads(line))
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"JSON inválido en línea {line_number} de {path}: {exc}") from exc
-        return chunks
 
-    data = json.loads(raw)
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict) and isinstance(data.get("chunks"), list):
-        return data["chunks"]
+            item = json.loads(line)
 
-    raise ValueError("Formato no reconocido. Usa JSONL, lista JSON, u objeto JSON con clave 'chunks'.")
+            text = item.get("text", "").strip()
+
+            if text:
+                chunks.append(item)
+
+    return chunks
 
 
-def get_chunk_text(chunk: dict[str, Any]) -> str:
-    text = chunk.get("text") or chunk.get("page_content") or chunk.get("content") or chunk.get("chunk") or ""
-    return str(text).strip()
+def get_embeddings_model() -> HuggingFaceEmbeddings:
+    print(f"Cargando modelo de embeddings: {EMBEDDING_MODEL}")
+
+    return HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL,
+        encode_kwargs={"normalize_embeddings": True},
+    )
 
 
-def deterministic_qdrant_id(chunk: dict[str, Any], text: str, index: int) -> str:
-    base = str(chunk.get("id") or chunk.get("chunk_id") or "")
-    if not base:
-        base = hashlib.sha1(f"{index}:{text[:500]}".encode("utf-8")).hexdigest()
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, base))
+def get_qdrant_client() -> QdrantClient:
+    client = QdrantClient(
+        url=QDRANT_URL,
+        api_key=QDRANT_API_KEY,
+    )
 
+    print("Conectado a Qdrant Cloud.")
 
-def batched(items: list[Any], batch_size: int) -> Iterable[list[Any]]:
-    for start in range(0, len(items), batch_size):
-        yield items[start : start + batch_size]
+    return client
 
 
 def get_existing_vector_size(client: QdrantClient, collection_name: str) -> int | None:
     info = client.get_collection(collection_name=collection_name)
-    vectors = info.config.params.vectors
+    vectors_config = info.config.params.vectors
 
-    # Colección con vector único.
-    if hasattr(vectors, "size"):
-        return int(vectors.size)
+    if hasattr(vectors_config, "size"):
+        return vectors_config.size
 
-    # Colección con named vectors, por si alguna vez se usa.
-    if isinstance(vectors, dict) and vectors:
-        first_vector = next(iter(vectors.values()))
-        if hasattr(first_vector, "size"):
-            return int(first_vector.size)
+    if isinstance(vectors_config, dict):
+        first_vector_config = next(iter(vectors_config.values()))
+        return first_vector_config.size
 
     return None
 
 
-def ensure_collection(client: QdrantClient, collection_name: str, vector_size: int) -> None:
+def ensure_collection(
+    client: QdrantClient,
+    collection_name: str,
+    vector_size: int,
+) -> None:
+    """
+    Crea la colección si no existe.
+    Si existe, comprueba que la dimensión sea compatible.
+    """
     if client.collection_exists(collection_name=collection_name):
         existing_size = get_existing_vector_size(client, collection_name)
 
-        if existing_size is not None and existing_size != vector_size:
+        if existing_size != vector_size:
             raise RuntimeError(
-                f"La colección '{collection_name}' ya existe con dimensión {existing_size}, "
+                f"La colección {collection_name} existe con dimensión {existing_size}, "
                 f"pero el modelo actual genera dimensión {vector_size}. "
-                "Solución: usa otra QDRANT_COLLECTION o limpia/recrea la colección."
+                "Borra la colección o usa otra colección."
             )
 
-        print(f"Colección existente válida: {collection_name} | dimensión={existing_size}")
+        print(
+            f"Colección existente válida: {collection_name} | dimensión={existing_size}"
+        )
         return
 
-    print(f"Creando colección: {collection_name} | dimensión vectorial: {vector_size}")
+    print(f"Creando colección: {collection_name} | dimensión={vector_size}")
+
     client.create_collection(
         collection_name=collection_name,
         vectors_config=models.VectorParams(
@@ -114,83 +123,74 @@ def ensure_collection(client: QdrantClient, collection_name: str, vector_size: i
         ),
     )
 
-
-def recreate_collection(client: QdrantClient, collection_name: str, vector_size: int) -> None:
-    if client.collection_exists(collection_name=collection_name):
-        print(f"Eliminando colección completa: {collection_name}")
-        client.delete_collection(collection_name=collection_name)
-
-    print(f"Creando colección limpia: {collection_name} | dimensión vectorial: {vector_size}")
-    client.create_collection(
-        collection_name=collection_name,
-        vectors_config=models.VectorParams(
-            size=vector_size,
-            distance=models.Distance.COSINE,
-        ),
-    )
+    print(f"Colección creada: {collection_name}")
 
 
-def build_payload(chunk: dict[str, Any], text: str, index: int, model_name: str) -> dict[str, Any]:
-    metadata = chunk.get("metadata") if isinstance(chunk.get("metadata"), dict) else {}
+def ensure_payload_indexes(client: QdrantClient, collection_name: str) -> None:
+    """
+    Qdrant Cloud necesita índice de payload para filtrar por document_id.
+    Este índice permite borrar chunks antiguos de un documento concreto.
+    """
+    try:
+        client.create_payload_index(
+            collection_name=collection_name,
+            field_name="document_id",
+            field_schema=models.PayloadSchemaType.KEYWORD,
+            wait=True,
+        )
 
-    payload: dict[str, Any] = {
-        "text": text,
-        "chunk_id": chunk.get("id") or chunk.get("chunk_id") or f"chunk_{index}",
-        "embedding_model": model_name,
-        "metadata": metadata,
-    }
+        print("Índice payload creado: document_id keyword")
 
-    # Campos principales duplicados en top-level para poder filtrar fácil en Qdrant.
-    for key in [
-        "source",
-        "filename",
-        "document_id",
-        "source_type",
-        "page",
-        "page_label",
-        "language",
-        "chunk_index",
-        "chunk_index_in_page",
-    ]:
-        value = metadata.get(key, chunk.get(key))
-        if value is not None:
-            payload[key] = value
+    except Exception as error:
+        error_text = str(error).lower()
 
-    if "chunk_index" not in payload:
-        payload["chunk_index"] = index
+        already_exists_messages = [
+            "already exists",
+            "already",
+            "conflict",
+            "same index",
+        ]
 
-    return payload
+        if any(message in error_text for message in already_exists_messages):
+            print("Índice payload ya existe: document_id keyword")
+            return
+
+        raise
 
 
-def values_from_chunks(chunks: list[dict[str, Any]], metadata_key: str) -> set[str]:
-    values: set[str] = set()
+def extract_document_ids(chunks: list[dict[str, Any]]) -> set[str]:
+    document_ids = set()
+
     for chunk in chunks:
-        metadata = chunk.get("metadata") if isinstance(chunk.get("metadata"), dict) else {}
-        value = metadata.get(metadata_key) or chunk.get(metadata_key)
-        if value is not None:
-            values.add(str(value))
-    return values
+        metadata = chunk.get("metadata", {})
+        document_id = metadata.get("document_id") or chunk.get("document_id")
+
+        if document_id:
+            document_ids.add(str(document_id))
+
+    return document_ids
 
 
-def delete_existing_by_field(
+def delete_existing_documents(
     client: QdrantClient,
     collection_name: str,
-    field_name: str,
-    values: set[str],
+    document_ids: set[str],
 ) -> None:
-    if not values:
-        return
+    """
+    Borra de Qdrant solo los chunks antiguos de los documentos que se van a reindexar.
+    No borra la colección completa.
+    """
+    for document_id in sorted(document_ids):
+        print(f"Borrando chunks antiguos: document_id={document_id}")
 
-    for value in sorted(values):
-        print(f"Borrando chunks antiguos: {field_name}={value}")
         client.delete(
             collection_name=collection_name,
             points_selector=models.FilterSelector(
                 filter=models.Filter(
                     must=[
                         models.FieldCondition(
-                            key=field_name,
-                            match=models.MatchValue(value=value),
+                            key="document_id",
+                            match=models.MatchValue(value=document_id),
                         )
                     ]
                 )
@@ -199,178 +199,222 @@ def delete_existing_by_field(
         )
 
 
-def delete_existing_sources(client: QdrantClient, collection_name: str, chunks: list[dict[str, Any]]) -> None:
-    """
-    Opción 2 del punto 7: borra solo los chunks de los documentos que estás reindexando.
-    Priorizamos document_id. Si no existe, usamos source.
-    """
-    document_ids = values_from_chunks(chunks, "document_id")
-    if document_ids:
-        delete_existing_by_field(client, collection_name, "document_id", document_ids)
-        return
+def build_points(
+    chunks: list[dict[str, Any]],
+    vectors: list[list[float]],
+) -> list[models.PointStruct]:
+    points = []
 
-    sources = values_from_chunks(chunks, "source")
-    delete_existing_by_field(client, collection_name, "source", sources)
+    for index, (chunk, vector) in enumerate(zip(chunks, vectors)):
+        text = chunk.get("text", "").strip()
+        metadata = chunk.get("metadata", {})
 
+        document_id = metadata.get("document_id") or chunk.get("document_id") or "unknown"
+        chunk_index = metadata.get("chunk_index", index)
 
-def upload_chunks_to_qdrant(
-    chunks_path: Path,
-    collection_name: str,
-    model_name: str,
-    delete_old_sources: bool,
-    recreate: bool,
-) -> None:
-    if not QDRANT_URL or not QDRANT_API_KEY:
-        raise RuntimeError("Faltan QDRANT_URL y/o QDRANT_API_KEY en tu .env")
+        payload = {
+            "text": text,
+            **metadata,
+        }
 
-    print(f"Leyendo chunks desde: {chunks_path}")
-    raw_chunks = read_chunks(chunks_path)
+        payload["document_id"] = str(document_id)
+        payload["chunk_index"] = chunk_index
 
-    clean_chunks: list[dict[str, Any]] = []
-    texts: list[str] = []
-    for idx, chunk in enumerate(raw_chunks):
-        text = get_chunk_text(chunk)
-        if not text:
-            print(f"Aviso: chunk vacío ignorado en índice {idx}")
-            continue
-        clean_chunks.append(chunk)
-        texts.append(text)
+        raw_id = chunk.get("id") or f"{document_id}_{chunk_index}_{index}"
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, str(raw_id)))
 
-    if not clean_chunks:
-        raise ValueError("No hay chunks con texto para subir a Qdrant.")
-
-    print(f"Chunks con texto: {len(clean_chunks)}")
-    print(f"Cargando modelo de embeddings: {model_name}")
-    model = SentenceTransformer(model_name)
-
-    print("Generando embeddings...")
-    embeddings = model.encode(
-        texts,
-        batch_size=EMBED_BATCH_SIZE,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-        show_progress_bar=True,
-    )
-
-    vector_size = int(embeddings.shape[1])
-    print(f"Dimensión de embeddings: {vector_size}")
-
-    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=60)
-    print("Conectado a Qdrant Cloud.")
-
-    if recreate:
-        recreate_collection(client, collection_name, vector_size)
-    else:
-        ensure_collection(client, collection_name, vector_size)
-
-    if delete_old_sources and not recreate:
-        delete_existing_sources(client, collection_name, clean_chunks)
-
-    total_uploaded = 0
-    indexed_items = list(enumerate(zip(clean_chunks, texts, embeddings)))
-
-    for batch in batched(indexed_items, UPSERT_BATCH_SIZE):
-        points: list[models.PointStruct] = []
-
-        for original_index, (chunk, text, vector) in batch:
-            point_id = deterministic_qdrant_id(chunk, text, original_index)
-            payload = build_payload(chunk, text, original_index, model_name)
-
-            points.append(
-                models.PointStruct(
-                    id=point_id,
-                    vector=vector.tolist(),
-                    payload=payload,
-                )
+        points.append(
+            models.PointStruct(
+                id=point_id,
+                vector=vector,
+                payload=payload,
             )
+        )
+
+    return points
+
+
+def upload_points(
+    client: QdrantClient,
+    collection_name: str,
+    points: list[models.PointStruct],
+    batch_size: int = 64,
+) -> None:
+    total = len(points)
+
+    for start in range(0, total, batch_size):
+        end = start + batch_size
+        batch = points[start:end]
 
         client.upsert(
             collection_name=collection_name,
-            points=points,
+            points=batch,
             wait=True,
         )
-        total_uploaded += len(points)
-        print(f"Subidos {total_uploaded}/{len(clean_chunks)} points")
 
-    count = client.count(collection_name=collection_name, exact=True).count
-    print("\nSubida completada.")
-    print(f"Colección: {collection_name}")
-    print(f"Points en la colección: {count}")
+        print(f"Subidos points {start + 1}-{min(end, total)} de {total}")
 
 
-def test_query(collection_name: str, model_name: str, query: str, top_k: int) -> None:
-    if not QDRANT_URL or not QDRANT_API_KEY:
-        raise RuntimeError("Faltan QDRANT_URL y/o QDRANT_API_KEY en tu .env")
+def query_qdrant(
+    client: QdrantClient,
+    embeddings_model: HuggingFaceEmbeddings,
+    question: str,
+    top_k: int,
+) -> None:
+    print("\nProbando búsqueda en Qdrant...")
+    print(f"Pregunta: {question}")
 
-    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=60)
-    model = SentenceTransformer(model_name)
+    query_vector = embeddings_model.embed_query(question)
 
-    query_vector = model.encode([query], normalize_embeddings=True, convert_to_numpy=True)[0].tolist()
-
-    response = client.query_points(
-        collection_name=collection_name,
+    results = client.query_points(
+        collection_name=QDRANT_COLLECTION,
         query=query_vector,
         limit=top_k,
         with_payload=True,
     )
 
-    print(f"\nResultados para: {query!r}")
-    for i, point in enumerate(response.points, start=1):
+    print("\nResultados encontrados:\n")
+
+    for index, point in enumerate(results.points, start=1):
         payload = point.payload or {}
-        text = str(payload.get("text", ""))
-        source = payload.get("source", "unknown")
-        page = payload.get("page", "?")
-        chunk_index = payload.get("chunk_index", "?")
-        preview = text.replace("\n", " ")[:500]
 
-        print("\n" + "=" * 80)
-        print(f"#{i} | score={point.score:.4f} | source={source} | page={page} | chunk_index={chunk_index}")
-        print(preview)
+        print(f"Resultado {index}")
+        print(f"Score: {point.score:.4f}")
+        print(f"Archivo: {payload.get('filename', 'desconocido')}")
+        print(f"Página: {payload.get('page_label', payload.get('page', 'desconocida'))}")
+        print(f"Document ID: {payload.get('document_id', 'desconocido')}")
+        print("Texto:")
+        print((payload.get("text") or "")[:800])
+        print("-" * 80)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Sube chunks JSONL a Qdrant Cloud con embeddings locales.")
-    parser.add_argument("--chunks-path", default=str(CHUNKS_FILE), help="Ruta al archivo chunks.jsonl")
-    parser.add_argument("--collection", default=QDRANT_COLLECTION, help="Nombre de colección en Qdrant")
-    parser.add_argument("--model", default=EMBEDDING_MODEL, help="Modelo sentence-transformers")
-    parser.add_argument("--query", default=None, help="Pregunta de prueba después de subir los points")
-    parser.add_argument("--top-k", type=int, default=5, help="Número de resultados para la pregunta de prueba")
-    parser.add_argument(
-        "--no-delete-existing-sources",
-        action="store_true",
-        help="No borrar chunks antiguos del mismo document_id/source antes de subir.",
+def recreate_collection(
+    client: QdrantClient,
+    collection_name: str,
+    vector_size: int,
+) -> None:
+    if client.collection_exists(collection_name=collection_name):
+        print(f"Borrando colección completa: {collection_name}")
+        client.delete_collection(collection_name=collection_name)
+
+    print(f"Creando colección desde cero: {collection_name}")
+
+    client.create_collection(
+        collection_name=collection_name,
+        vectors_config=models.VectorParams(
+            size=vector_size,
+            distance=models.Distance.COSINE,
+        ),
     )
-    parser.add_argument(
-        "--recreate-collection",
-        action="store_true",
-        help="Elimina la colección completa, la recrea y después sube los chunks.",
-    )
-    return parser.parse_args()
+
+    print(f"Colección recreada: {collection_name}")
 
 
 def main() -> None:
-    args = parse_args()
+    parser = argparse.ArgumentParser(
+        description="Sube chunks a Qdrant y permite búsqueda de prueba."
+    )
 
-    try:
-        upload_chunks_to_qdrant(
-            chunks_path=Path(args.chunks_path),
-            collection_name=args.collection,
-            model_name=args.model,
-            delete_old_sources=not args.no_delete_existing_sources,
-            recreate=args.recreate_collection,
+    parser.add_argument(
+        "--recreate-collection",
+        action="store_true",
+        help="Borra toda la colección y la crea de nuevo.",
+    )
+
+    parser.add_argument(
+        "--query",
+        type=str,
+        default=None,
+        help="Pregunta opcional para probar búsqueda en Qdrant después de subir.",
+    )
+
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=5,
+        help="Número de resultados para la query de prueba.",
+    )
+
+    args = parser.parse_args()
+
+    validate_config()
+
+    chunks_path = Path(CHUNKS_FILE)
+
+    print(f"Leyendo chunks desde: {chunks_path}")
+
+    chunks = load_chunks(chunks_path)
+    print(f"Chunks con texto: {len(chunks)}")
+
+    if not chunks:
+        raise RuntimeError("No hay chunks con texto para subir.")
+
+    texts = [chunk["text"] for chunk in chunks]
+
+    embeddings_model = get_embeddings_model()
+
+    print("Generando embeddings...")
+    vectors = embeddings_model.embed_documents(texts)
+
+    if not vectors:
+        raise RuntimeError("No se han generado embeddings.")
+
+    vector_size = len(vectors[0])
+    print(f"Dimensión de embeddings: {vector_size}")
+
+    client = get_qdrant_client()
+
+    if args.recreate_collection:
+        recreate_collection(
+            client=client,
+            collection_name=QDRANT_COLLECTION,
+            vector_size=vector_size,
+        )
+    else:
+        ensure_collection(
+            client=client,
+            collection_name=QDRANT_COLLECTION,
+            vector_size=vector_size,
         )
 
-        if args.query:
-            test_query(
-                collection_name=args.collection,
-                model_name=args.model,
-                query=args.query,
-                top_k=args.top_k,
-            )
+    ensure_payload_indexes(
+        client=client,
+        collection_name=QDRANT_COLLECTION,
+    )
 
-    except Exception as exc:
-        print(f"\nERROR: {exc}", file=sys.stderr)
-        sys.exit(1)
+    document_ids = extract_document_ids(chunks)
+
+    if document_ids:
+        delete_existing_documents(
+            client=client,
+            collection_name=QDRANT_COLLECTION,
+            document_ids=document_ids,
+        )
+    else:
+        print("No se han encontrado document_id en los chunks. No se borra nada antes del upsert.")
+
+    points = build_points(
+        chunks=chunks,
+        vectors=vectors,
+    )
+
+    print(f"Subiendo {len(points)} chunks a Qdrant...")
+
+    upload_points(
+        client=client,
+        collection_name=QDRANT_COLLECTION,
+        points=points,
+    )
+
+    print("Subida completada.")
+
+    if args.query:
+        query_qdrant(
+            client=client,
+            embeddings_model=embeddings_model,
+            question=args.query,
+            top_k=args.top_k,
+        )
 
 
 if __name__ == "__main__":
