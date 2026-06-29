@@ -6,7 +6,7 @@ El flujo principal es:
 
 ```text
 PDF
-↓
+↓gi 
 Extracción de texto
 ↓
 Extracción página a página
